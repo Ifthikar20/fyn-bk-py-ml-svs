@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     max_results: int = 20
     similarity_threshold: float = 0.5
     
+    # Attribute Extraction
+    blip_model: str = "Salesforce/blip-image-captioning-base"
+    use_blip: bool = True
+    num_color_clusters: int = 3
+    
     class Config:
         env_file = ".env"
         env_prefix = "ML_"

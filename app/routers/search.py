@@ -182,3 +182,79 @@ async def save_index():
     except Exception as e:
         logger.error(f"Save index failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# ATTRIBUTE EXTRACTION ENDPOINTS
+# ============================================================================
+
+class ExtractAttributesRequest(BaseModel):
+    """Request model for attribute extraction."""
+    image_base64: str = Field(..., description="Base64 encoded image data")
+
+
+class ColorInfo(BaseModel):
+    """Color information."""
+    hex: str
+    name: str
+    synonyms: List[str]
+    rgb: List[int]
+
+
+class ExtractAttributesResponse(BaseModel):
+    """Response model for attribute extraction."""
+    success: bool
+    caption: str
+    colors: Dict[str, ColorInfo]
+    textures: List[str]
+    category: str
+    search_queries: List[str]
+    processing_time_ms: float
+
+
+@router.post("/extract-attributes", response_model=ExtractAttributesResponse)
+async def extract_attributes(request: ExtractAttributesRequest):
+    """
+    Extract searchable attributes from an image.
+    
+    Returns caption, colors, textures, and generated search queries
+    optimized for marketplace API searches.
+    """
+    start_time = time.time()
+    
+    try:
+        from ..models import get_attribute_extractor
+        
+        # Get extractor
+        extractor = get_attribute_extractor()
+        
+        # Extract attributes
+        result = extractor.extract(request.image_base64)
+        
+        # Calculate processing time
+        processing_time_ms = (time.time() - start_time) * 1000
+        
+        # Convert colors to response format
+        colors_response = {}
+        for key, color in result.colors.items():
+            colors_response[key] = ColorInfo(
+                hex=color.hex,
+                name=color.name,
+                synonyms=color.synonyms,
+                rgb=list(color.rgb)
+            )
+        
+        return ExtractAttributesResponse(
+            success=True,
+            caption=result.caption,
+            colors=colors_response,
+            textures=result.textures,
+            category=result.category,
+            search_queries=result.search_queries,
+            processing_time_ms=round(processing_time_ms, 2)
+        )
+    
+    except Exception as e:
+        logger.error(f"Attribute extraction failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
