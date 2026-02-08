@@ -191,6 +191,7 @@ async def save_index():
 class ExtractAttributesRequest(BaseModel):
     """Request model for attribute extraction."""
     image_base64: str = Field(..., description="Base64 encoded image data")
+    skip_ocr: bool = Field(True, description="Skip OCR for speed (saves ~8s on CPU)")
 
 
 class ColorInfo(BaseModel):
@@ -217,24 +218,72 @@ async def extract_attributes(request: ExtractAttributesRequest):
     """
     Extract searchable attributes from an image.
     
+    Uses Fashion-CLIP (fine-tuned) as primary model for accurate fashion
+    understanding. Falls back to EfficientNet if Fashion-CLIP unavailable.
+    
     Returns caption, colors, textures, and generated search queries
     optimized for marketplace API searches.
     """
     start_time = time.time()
     
     try:
+        import base64
+        from PIL import Image as PILImage
+        import io
+        
+        # Decode image
+        image_data = base64.b64decode(request.image_base64)
+        image = PILImage.open(io.BytesIO(image_data)).convert('RGB')
+        
+        # Try Fashion-CLIP first (accurate fashion understanding)
+        try:
+            from ..models import get_fashion_clip
+            fashion_clip = get_fashion_clip()
+            
+            result = fashion_clip.extract_attributes(image)
+            
+            processing_time_ms = (time.time() - start_time) * 1000
+            logger.info(f"Fashion-CLIP extraction: {result['caption']} ({processing_time_ms:.0f}ms)")
+            
+            # Convert Fashion-CLIP colors to response format
+            colors_response = {}
+            if result.get("colors", {}).get("primary"):
+                primary = result["colors"]["primary"]
+                colors_response["dominant"] = ColorInfo(
+                    hex="#000000",  # Fashion-CLIP doesn't extract hex
+                    name=primary,
+                    synonyms=result["colors"].get("secondary", []),
+                    rgb=[0, 0, 0]
+                )
+                # Add secondary colors
+                for i, sec_color in enumerate(result["colors"].get("secondary", [])[:2]):
+                    colors_response[f"accent_{i+1}"] = ColorInfo(
+                        hex="#000000",
+                        name=sec_color,
+                        synonyms=[],
+                        rgb=[0, 0, 0]
+                    )
+            
+            return ExtractAttributesResponse(
+                success=True,
+                caption=result.get("caption", ""),
+                colors=colors_response,
+                textures=[result.get("pattern", "solid"), result.get("material", "")] if result.get("material") else [result.get("pattern", "solid")],
+                category=result.get("category", ""),
+                search_queries=result.get("search_queries", []),
+                processing_time_ms=round(processing_time_ms, 2)
+            )
+        
+        except Exception as fc_error:
+            logger.warning(f"Fashion-CLIP failed, falling back to EfficientNet: {fc_error}")
+        
+        # Fallback: EfficientNet-based extractor
         from ..models import get_attribute_extractor
-        
-        # Get extractor
         extractor = get_attribute_extractor()
+        result = extractor.extract(request.image_base64, skip_ocr=request.skip_ocr)
         
-        # Extract attributes
-        result = extractor.extract(request.image_base64)
-        
-        # Calculate processing time
         processing_time_ms = (time.time() - start_time) * 1000
         
-        # Convert colors to response format
         colors_response = {}
         for key, color in result.colors.items():
             colors_response[key] = ColorInfo(
@@ -257,4 +306,5 @@ async def extract_attributes(request: ExtractAttributesRequest):
     except Exception as e:
         logger.error(f"Attribute extraction failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 

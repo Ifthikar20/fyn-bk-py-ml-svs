@@ -3,9 +3,7 @@ fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.6
 
-# ML & Image Processing
-torch>=2.0.0
-torchvision>=0.15.0
+# ML & Image Processing (torch/torchvision installed in Dockerfile with CPU-only)
 Pillow>=10.0.0
 numpy>=1.24.0
 
@@ -22,6 +20,7 @@ scikit-image>=0.22.0
 webcolors>=1.13
 scipy>=1.11.0
 easyocr>=1.7.0
+open_clip_torch>=2.24.0
 
 # Utilities
 python-dotenv>=1.0.0
