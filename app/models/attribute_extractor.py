@@ -9,8 +9,10 @@ from typing import Dict, List, Tuple, Union, Optional
 import io
 import base64
 import logging
+import time
 from dataclasses import dataclass, asdict
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 import colorsys
 
 logger = logging.getLogger(__name__)
@@ -162,15 +164,17 @@ class AttributeExtractor:
         "jordan", "yeezy", "balenciaga", "fendi", "hermes", "coach", "michael kors"
     }
     
-    def __init__(self, use_blip: bool = True, use_ocr: bool = True):
+    def __init__(self, use_blip: bool = False, use_ocr: bool = True):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.use_blip = use_blip
+        self.use_blip = use_blip  # Disabled by default — too heavy for CPU
         self.use_ocr = use_ocr
         
         # Initialize models lazily
         self._blip_processor = None
         self._blip_model = None
         self._ocr_reader = None
+        self._efficientnet = None
+        self._efficientnet_transforms = None
         
         logger.info(f"AttributeExtractor initialized on device: {self.device}")
     
@@ -291,8 +295,8 @@ class AttributeExtractor:
             price=price
         )
     
-    def _preprocess_image(self, image: Union[str, bytes, Image.Image]) -> Image.Image:
-        """Convert input to PIL Image."""
+    def _preprocess_image(self, image: Union[str, bytes, Image.Image], max_size: int = 800) -> Image.Image:
+        """Convert input to PIL Image and resize for speed."""
         if isinstance(image, str):
             # Base64 string
             image_bytes = base64.b64decode(image)
@@ -303,38 +307,148 @@ class AttributeExtractor:
         if image.mode != "RGB":
             image = image.convert("RGB")
         
+        # Resize large images for faster processing
+        if max(image.size) > max_size:
+            image.thumbnail((max_size, max_size), Image.LANCZOS)
+            logger.info(f"Resized image to {image.size}")
+        
         return image
     
+    def _load_efficientnet(self):
+        """Lazy load EfficientNet for fast image classification."""
+        if self._efficientnet is None:
+            try:
+                from torchvision import models, transforms
+                logger.info("Loading EfficientNet-B0 for classification...")
+                self._efficientnet = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+                self._efficientnet.eval()
+                self._efficientnet.to(self.device)
+                self._efficientnet_transforms = transforms.Compose([
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ])
+                logger.info("EfficientNet-B0 loaded for classification")
+            except Exception as e:
+                logger.error(f"Failed to load EfficientNet: {e}")
+    
+    # Fashion-relevant ImageNet class mappings
+    IMAGENET_FASHION_MAP = {
+        # Clothing
+        "jersey": "jersey top", "suit": "suit", "academic_gown": "gown",
+        "jean": "jeans", "swimming_trunks": "swim trunks", "bikini": "bikini",
+        "miniskirt": "mini skirt", "overskirt": "skirt", "hoopskirt": "hoop skirt",
+        "sarong": "sarong", "kimono": "kimono", "abaya": "abaya",
+        "poncho": "poncho", "cardigan": "cardigan", "sweatshirt": "sweatshirt",
+        "trench_coat": "trench coat", "lab_coat": "coat", "fur_coat": "fur coat",
+        "bulletproof_vest": "vest", "brassiere": "bra", "pajama": "pajamas",
+        "bow_tie": "bow tie", "neck_brace": "necklace",
+        # Shoes
+        "running_shoe": "running shoes", "clog": "clogs", "sandal": "sandals",
+        "cowboy_boot": "cowboy boots", "Loafer": "loafers",
+        # Bags
+        "backpack": "backpack", "purse": "purse", "handbag": "handbag",
+        "shopping_basket": "tote bag", "mailbag": "messenger bag",
+        "plastic_bag": "bag",
+        # Accessories
+        "sunglass": "sunglasses", "sunglasses": "sunglasses",
+        "watch": "watch", "digital_watch": "digital watch",
+        "necklace": "necklace", "hat": "hat", "sombrero": "hat",
+        "cowboy_hat": "cowboy hat", "bonnet": "bonnet",
+        "shower_cap": "cap", "swimming_cap": "cap",
+        "ski_mask": "mask", "bolo_tie": "bolo tie",
+        "scarf": "scarf", "stole": "stole",
+        "wallet": "wallet", "pencil_case": "pouch",
+        # Person-related labels (EfficientNet often returns these for people wearing clothes)
+        "nematode": "clothing", "lipstick": "clothing", "face_powder": "clothing",
+        "makeup": "clothing", "wig": "clothing", "mask": "clothing",
+        "hair_slide": "clothing", "Band_Aid": "clothing",
+        "shower_curtain": "clothing", "window_shade": "clothing",
+        "spotlight": "clothing", "desk": "clothing", "screen": "clothing",
+        # Other products
+        "perfume": "perfume", "lotion": "lotion",
+        "hair_spray": "hair product",
+        "pillow": "pillow", "quilt": "quilt", "blanket": "blanket",
+        "teddy": "stuffed toy", "candle": "candle",
+        "water_bottle": "water bottle", "beer_bottle": "bottle",
+        "wine_bottle": "wine", "coffee_mug": "mug", "cup": "cup",
+        "plate": "plate", "bowl": "bowl",
+    }
+    
+    # Map nuanced colors to simpler, more searchable terms
+    COLOR_SIMPLIFY_MAP = {
+        "teal": "green", "cyan": "blue", "aqua": "blue", "turquoise": "green",
+        "magenta": "pink", "fuchsia": "pink", "crimson": "red", "scarlet": "red",
+        "burgundy": "red", "maroon": "red", "coral": "pink", "salmon": "pink",
+        "navy": "blue", "indigo": "blue", "cobalt": "blue", "azure": "blue",
+        "olive": "green", "lime": "green", "sage": "green", "mint": "green",
+        "khaki": "beige", "tan": "brown", "camel": "brown", "sand": "beige",
+        "charcoal": "gray", "slate": "gray", "silver": "gray",
+        "ivory": "white", "cream": "white", "eggshell": "white",
+        "plum": "purple", "lavender": "purple", "violet": "purple",
+        "mauve": "purple", "lilac": "purple",
+        "gold": "yellow", "amber": "yellow", "mustard": "yellow",
+        "rust": "orange", "copper": "orange", "peach": "orange",
+    }
+    
     def generate_caption(self, image: Image.Image) -> str:
-        """Generate image caption using BLIP."""
-        if not self.use_blip:
-            return ""
+        """Generate image caption using EfficientNet classification (fast, <1s on CPU)."""
+        # Use BLIP if available (GPU environments)
+        if self.use_blip:
+            self._load_blip()
+            if self._blip_model is not None:
+                try:
+                    blip_image = image.copy()
+                    blip_image.thumbnail((384, 384), Image.LANCZOS)
+                    inputs = self._blip_processor(
+                        blip_image, text="a photo of", return_tensors="pt"
+                    ).to(self.device)
+                    with torch.no_grad():
+                        output = self._blip_model.generate(
+                            **inputs, max_length=30, num_beams=1, do_sample=False,
+                        )
+                    return self._blip_processor.decode(output[0], skip_special_tokens=True)
+                except Exception as e:
+                    logger.error(f"BLIP caption failed: {e}")
         
-        self._load_blip()
-        
-        if self._blip_model is None:
+        # Fast path: EfficientNet ImageNet classification (<1s on CPU)
+        self._load_efficientnet()
+        if self._efficientnet is None:
             return ""
         
         try:
-            # Use fashion-focused prompt
-            inputs = self._blip_processor(
-                image, 
-                text="a photo of",
-                return_tensors="pt"
-            ).to(self.device)
+            img_tensor = self._efficientnet_transforms(image).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
-                output = self._blip_model.generate(
-                    **inputs,
-                    max_length=50,
-                    num_beams=5,
-                    early_stopping=True
-                )
+                output = self._efficientnet(img_tensor)
+                probs = torch.nn.functional.softmax(output[0], dim=0)
+                top5_prob, top5_idx = torch.topk(probs, 5)
             
-            caption = self._blip_processor.decode(output[0], skip_special_tokens=True)
-            return caption
+            # Get ImageNet class names
+            from torchvision.models import EfficientNet_B0_Weights
+            categories = EfficientNet_B0_Weights.IMAGENET1K_V1.meta["categories"]
+            
+            # Find best fashion-relevant label
+            for prob, idx in zip(top5_prob, top5_idx):
+                label = categories[idx.item()]
+                label_clean = label.replace(" ", "_").lower()
+                
+                # Check fashion map first
+                for key, fashion_name in self.IMAGENET_FASHION_MAP.items():
+                    if key.lower() in label_clean or label_clean in key.lower():
+                        confidence = prob.item()
+                        logger.info(f"EfficientNet: {label} ({confidence:.1%}) -> {fashion_name}")
+                        return f"a photo of {fashion_name}"
+            
+            # Fallback: use top-1 label as-is
+            top_label = categories[top5_idx[0].item()].replace("_", " ")
+            top_conf = top5_prob[0].item()
+            logger.info(f"EfficientNet top-1: {top_label} ({top_conf:.1%})")
+            return f"a photo of {top_label}"
+            
         except Exception as e:
-            logger.error(f"Caption generation failed: {e}")
+            logger.error(f"EfficientNet caption failed: {e}")
             return ""
     
     def extract_colors(
@@ -492,66 +606,104 @@ class AttributeExtractor:
         textures: List[str],
         category: str
     ) -> List[str]:
-        """Generate multiple search query variations."""
+        """Generate smart search query variations optimized for fashion search."""
         queries = []
         
         primary_color = colors.get("primary")
         color_name = primary_color.name if primary_color else ""
         color_synonyms = primary_color.synonyms if primary_color else []
         
+        # Simplify color for better search results (teal → green, etc.)
+        simple_color = self.COLOR_SIMPLIFY_MAP.get(color_name.lower(), color_name) if color_name else ""
+        
         texture = textures[0] if textures else ""
+        skip_texture = texture in ("solid", "unknown", "")
         
-        # Primary query: color + texture + category
-        if color_name and texture and category:
-            queries.append(f"{color_name} {texture} {category}")
+        # When category is generic "clothing", generate garment-specific queries
+        # This handles cases where EfficientNet can't identify the specific garment type
+        if category == "clothing" and simple_color:
+            # Most common garment types to try
+            garment_types = ["shirt", "top", "dress"]
+            for garment in garment_types:
+                queries.append(f"{simple_color} {garment}")
+            # Also try with original nuanced color for variety
+            if color_name.lower() != simple_color.lower():
+                queries.append(f"{color_name} shirt")
+        elif category != "clothing":
+            # Specific category: use it directly
+            if simple_color and not skip_texture:
+                queries.append(f"{simple_color} {texture} {category}")
+            if simple_color:
+                queries.append(f"{simple_color} {category}")
+            queries.append(category)
         
-        # Category + color
-        if color_name and category:
-            queries.append(f"{color_name} {category}")
-        
-        # Using color synonyms
-        for syn in color_synonyms[:2]:
-            queries.append(f"{syn} {category}")
-        
-        # From caption (extract key terms)
+        # From caption (only if it's a specific item, not generic classifications)
         if caption:
-            # Use caption as-is but cleaned
             clean_caption = caption.replace("a photo of", "").strip()
-            if clean_caption and clean_caption not in queries:
-                queries.append(clean_caption)
+            generic_terms = {"clothing", "makeup", "nematode", "mask", "wig"}
+            if clean_caption and clean_caption.lower() not in generic_terms:
+                if clean_caption not in queries:
+                    queries.append(clean_caption)
         
-        # Texture-focused query
-        if texture != "solid" and texture != "unknown":
+        # Texture-focused query (only for specific, non-generic categories)
+        if not skip_texture and category != "clothing":
             queries.append(f"{texture} {category}")
+        
+        # Ensure at least one query exists
+        if not queries:
+            if simple_color:
+                queries.append(f"{simple_color} fashion")
+            elif caption:
+                queries.append(caption.replace("a photo of", "").strip())
+            else:
+                queries.append("fashion")
         
         return list(dict.fromkeys(queries))[:5]  # Unique, max 5
     
-    def extract(self, image: Union[str, bytes, Image.Image]) -> AttributeResult:
+    def extract(self, image: Union[str, bytes, Image.Image], skip_ocr: bool = True) -> AttributeResult:
         """
         Extract all attributes from an image using hybrid OCR + Visual AI.
         
         Args:
             image: Base64 string, bytes, or PIL Image
+            skip_ocr: Skip OCR for speed (default True — saves ~8s on CPU)
             
         Returns:
-            AttributeResult with caption, colors, textures, OCR, and search queries
+            AttributeResult with caption, colors, textures, and search queries
         """
-        # Preprocess
-        pil_image = self._preprocess_image(image)
+        t0 = time.time()
         
-        # Extract visual attributes
-        caption = self.generate_caption(pil_image)
-        colors = self.extract_colors(pil_image)
-        textures = self.detect_textures(pil_image)
+        # Preprocess (includes resize to max 800px)
+        pil_image = self._preprocess_image(image)
+        logger.info(f"Preprocess: {(time.time()-t0)*1000:.0f}ms")
+        
+        # Run caption, colors, textures IN PARALLEL (they're independent)
+        t1 = time.time()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            caption_future = executor.submit(self.generate_caption, pil_image)
+            colors_future = executor.submit(self.extract_colors, pil_image)
+            textures_future = executor.submit(self.detect_textures, pil_image)
+            
+            caption = caption_future.result()
+            colors = colors_future.result()
+            textures = textures_future.result()
+        
+        logger.info(f"Parallel extraction: {(time.time()-t1)*1000:.0f}ms")
+        
         category = self._detect_category(caption)
         
-        # Extract text via OCR
-        ocr_result = self._extract_text_ocr(pil_image)
+        # OCR is optional — skip by default for speed (~8s savings on CPU)
+        if skip_ocr:
+            ocr_result = OCRResult(raw_text="", brand=None, product_name=None, price=None)
+        else:
+            ocr_result = self._extract_text_ocr(pil_image)
         
-        # Generate search queries (combining visual + OCR)
+        # Generate search queries (combining visual + OCR if available)
         search_queries = self._generate_hybrid_queries(
             caption, colors, textures, category, ocr_result
         )
+        
+        logger.info(f"Total extract: {(time.time()-t0)*1000:.0f}ms")
         
         return AttributeResult(
             caption=caption,
@@ -559,7 +711,6 @@ class AttributeExtractor:
             textures=textures,
             category=category,
             search_queries=search_queries,
-            ocr=ocr_result
         )
     
     def _generate_hybrid_queries(
@@ -576,33 +727,57 @@ class AttributeExtractor:
         primary_color = colors.get("primary")
         color_name = primary_color.name if primary_color else ""
         texture = textures[0] if textures else ""
+        skip_texture = texture in ("solid", "unknown", "")
+        
+        # Simplify color for better search results (teal → green, etc.)
+        simple_color = self.COLOR_SIMPLIFY_MAP.get(color_name.lower(), color_name) if color_name else ""
         
         # Priority 1: OCR brand + visual description (most accurate)
         if ocr.brand:
-            if color_name and category:
-                queries.append(f"{ocr.brand} {color_name} {category}")
+            if simple_color and category:
+                queries.append(f"{ocr.brand} {simple_color} {category}")
             if category:
                 queries.append(f"{ocr.brand} {category}")
-            # Brand + OCR product name
             if ocr.product_name:
                 queries.append(f"{ocr.brand} {ocr.product_name}")
         
-        # Priority 2: Visual AI queries
-        if color_name and texture and category:
-            queries.append(f"{color_name} {texture} {category}")
+        # Priority 2: Visual AI queries — handle generic "clothing" specially
+        if category == "clothing" and simple_color:
+            # EfficientNet can't distinguish garment types — try common ones
+            for garment in ["shirt", "top", "dress"]:
+                queries.append(f"{simple_color} {garment}")
+            # Also try with original nuanced color
+            if color_name.lower() != simple_color.lower():
+                queries.append(f"{color_name} shirt")
+        elif category != "clothing":
+            # Specific category: use it directly
+            if simple_color and not skip_texture:
+                queries.append(f"{simple_color} {texture} {category}")
+            if simple_color:
+                queries.append(f"{simple_color} {category}")
+            queries.append(category)
         
-        if color_name and category:
-            queries.append(f"{color_name} {category}")
-        
-        # Priority 3: Caption-based
+        # Priority 3: Caption-based (skip generic/irrelevant captions)
         if caption:
             clean_caption = caption.replace("a photo of", "").strip()
-            if clean_caption and clean_caption not in queries:
-                queries.append(clean_caption)
+            generic_terms = {"clothing", "makeup", "nematode", "mask", "wig", 
+                           "face_powder", "lipstick", "screen", "desk"}
+            if clean_caption and clean_caption.lower() not in generic_terms:
+                if clean_caption not in queries:
+                    queries.append(clean_caption)
         
         # Priority 4: OCR product name alone
         if ocr.product_name and ocr.product_name not in queries:
             queries.append(ocr.product_name)
+        
+        # Ensure at least one query
+        if not queries:
+            if simple_color:
+                queries.append(f"{simple_color} fashion")
+            elif caption:
+                queries.append(caption.replace("a photo of", "").strip())
+            else:
+                queries.append("fashion")
         
         return list(dict.fromkeys(queries))[:6]  # Unique, max 6
 
@@ -611,7 +786,7 @@ class AttributeExtractor:
 _extractor_instance = None
 
 
-def get_attribute_extractor(use_blip: bool = True) -> AttributeExtractor:
+def get_attribute_extractor(use_blip: bool = False) -> AttributeExtractor:
     """Get singleton attribute extractor instance."""
     global _extractor_instance
     if _extractor_instance is None:
