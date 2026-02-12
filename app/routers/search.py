@@ -242,27 +242,79 @@ async def extract_attributes(request: ExtractAttributesRequest):
             
             result = fashion_clip.extract_attributes(image)
             
+            # Override CLIP's text-guessed colors with accurate pixel-based extraction
+            # CLIP says "teal" when pixels are actually "light blue" — K-means fixes this
+            from ..models import get_attribute_extractor
+            pixel_extractor = get_attribute_extractor()
+            pixel_colors = pixel_extractor.extract_colors(image)
+            
+            # Use pixel-extracted colors for accurate color names
+            if pixel_colors:
+                primary_pixel = pixel_colors.get("primary")
+                secondary_pixel = pixel_colors.get("secondary")
+                
+                # Override CLIP colors with pixel colors
+                accurate_primary = primary_pixel.name if primary_pixel else result["colors"].get("primary", "")
+                accurate_secondary = [secondary_pixel.name] if secondary_pixel else result["colors"].get("secondary", [])
+                
+                # Regenerate search queries with accurate colors
+                result["colors"]["primary"] = accurate_primary
+                result["colors"]["secondary"] = accurate_secondary
+                
+                # Rebuild search queries with pixel-accurate colors
+                result["search_queries"] = fashion_clip._generate_search_queries(
+                    category=result.get("category", "clothing"),
+                    primary_color=accurate_primary,
+                    secondary_colors=accurate_secondary,
+                    pattern=result.get("pattern", ""),
+                    material=result.get("material", ""),
+                    style=result.get("style", ""),
+                    gender=result.get("gender", ""),
+                )
+                
+                # Rebuild caption with accurate color
+                caption_parts = []
+                if accurate_primary:
+                    caption_parts.append(accurate_primary)
+                if result.get("pattern") and result["pattern"] != "solid":
+                    caption_parts.append(result["pattern"])
+                if result.get("material"):
+                    caption_parts.append(result["material"])
+                caption_parts.append(result.get("category", "clothing"))
+                result["caption"] = " ".join(caption_parts)
+                
+                logger.info(f"Color override: CLIP said '{result['colors'].get('primary', '?')}' → pixels say '{accurate_primary}'")
+            
             processing_time_ms = (time.time() - start_time) * 1000
             logger.info(f"Fashion-CLIP extraction: {result['caption']} ({processing_time_ms:.0f}ms)")
             
-            # Convert Fashion-CLIP colors to response format
+            # Convert colors to response format with accurate pixel data
             colors_response = {}
-            if result.get("colors", {}).get("primary"):
+            if pixel_colors.get("primary"):
+                p = pixel_colors["primary"]
+                colors_response["dominant"] = ColorInfo(
+                    hex=p.hex,
+                    name=p.name,
+                    synonyms=list(p.synonyms),
+                    rgb=list(p.rgb)
+                )
+            elif result.get("colors", {}).get("primary"):
                 primary = result["colors"]["primary"]
                 colors_response["dominant"] = ColorInfo(
-                    hex="#000000",  # Fashion-CLIP doesn't extract hex
+                    hex="#000000",
                     name=primary,
                     synonyms=result["colors"].get("secondary", []),
                     rgb=[0, 0, 0]
                 )
-                # Add secondary colors
-                for i, sec_color in enumerate(result["colors"].get("secondary", [])[:2]):
-                    colors_response[f"accent_{i+1}"] = ColorInfo(
-                        hex="#000000",
-                        name=sec_color,
-                        synonyms=[],
-                        rgb=[0, 0, 0]
-                    )
+            
+            if pixel_colors.get("secondary"):
+                s = pixel_colors["secondary"]
+                colors_response["accent_1"] = ColorInfo(
+                    hex=s.hex,
+                    name=s.name,
+                    synonyms=list(s.synonyms),
+                    rgb=list(s.rgb)
+                )
             
             return ExtractAttributesResponse(
                 success=True,
