@@ -185,6 +185,82 @@ async def save_index():
 
 
 # ============================================================================
+# CLIP TEXT-IMAGE RE-RANKING ENDPOINTS
+# ============================================================================
+
+class RerankProduct(BaseModel):
+    """A product to re-rank."""
+    product_id: str = Field(..., description="Product identifier")
+    image_url: str = Field(..., description="Product image URL")
+
+
+class ClipRerankRequest(BaseModel):
+    """Request model for CLIP re-ranking."""
+    query: str = Field(..., description="Text search query (e.g., 'blue tote bag for men')")
+    products: List[RerankProduct] = Field(..., description="Products to re-rank")
+
+
+class RerankResultItem(BaseModel):
+    """A re-ranked product with similarity score."""
+    product_id: str
+    similarity_score: float
+
+
+class ClipRerankResponse(BaseModel):
+    """Response model for CLIP re-ranking."""
+    success: bool
+    query: str
+    total_scored: int
+    processing_time_ms: float
+    results: List[RerankResultItem]
+
+
+@router.post("/clip-rerank", response_model=ClipRerankResponse)
+async def clip_rerank(request: ClipRerankRequest):
+    """
+    Re-rank products by visual similarity to a text query using Fashion-CLIP.
+    
+    Sends a text query (e.g., "blue tote bag for men") and a list of products
+    with image URLs. Returns products sorted by how well their images match
+    the text description, scored by CLIP cosine similarity.
+    """
+    start_time = time.time()
+    
+    try:
+        from ..models import get_fashion_clip
+        fashion_clip = get_fashion_clip()
+        
+        image_urls = [p.image_url for p in request.products]
+        product_ids = [p.product_id for p in request.products]
+        
+        ranked = fashion_clip.rerank_by_text(
+            query=request.query,
+            image_urls=image_urls,
+            product_ids=product_ids,
+        )
+        
+        processing_time_ms = (time.time() - start_time) * 1000
+        
+        return ClipRerankResponse(
+            success=True,
+            query=request.query,
+            total_scored=len([r for r in ranked if r["similarity_score"] > 0]),
+            processing_time_ms=round(processing_time_ms, 2),
+            results=[
+                RerankResultItem(
+                    product_id=r["product_id"],
+                    similarity_score=r["similarity_score"],
+                )
+                for r in ranked
+            ],
+        )
+    
+    except Exception as e:
+        logger.error(f"CLIP re-rank failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 # ATTRIBUTE EXTRACTION ENDPOINTS
 # ============================================================================
 

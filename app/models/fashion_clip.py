@@ -379,6 +379,107 @@ class FashionCLIP:
                 unique_queries.append(q)
         
         return unique_queries[:5]
+    def rerank_by_text(
+        self,
+        query: str,
+        image_urls: List[str],
+        product_ids: List[str],
+    ) -> List[Dict]:
+        """
+        Re-rank products by CLIP text-image similarity.
+        
+        Downloads product images, encodes them with CLIP, and scores
+        against the text query. Returns products sorted by visual relevance.
+        
+        Args:
+            query: Text search query (e.g., "blue tote bag for men")
+            image_urls: List of product image URLs
+            product_ids: Corresponding product IDs
+            
+        Returns:
+            List of dicts with product_id and similarity_score, sorted desc.
+        """
+        import io
+        import requests as req
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        t0 = time.time()
+        
+        # Step 1: Encode the text query
+        with torch.no_grad():
+            text_features = self._encode_texts([f"a photo of {query}"])
+        
+        # Step 2: Download and encode images in parallel
+        def download_image(url: str) -> Optional[Image.Image]:
+            try:
+                resp = req.get(url, timeout=3, headers={
+                    "User-Agent": "Mozilla/5.0"
+                })
+                if resp.status_code == 200:
+                    return Image.open(io.BytesIO(resp.content)).convert("RGB")
+            except Exception:
+                pass
+            return None
+        
+        # Download all images in parallel
+        images = [None] * len(image_urls)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_idx = {
+                executor.submit(download_image, url): i
+                for i, url in enumerate(image_urls)
+            }
+            for future in as_completed(future_to_idx, timeout=5):
+                idx = future_to_idx[future]
+                try:
+                    images[idx] = future.result()
+                except Exception:
+                    pass
+        
+        download_ms = (time.time() - t0) * 1000
+        
+        # Step 3: Encode all successfully downloaded images
+        results = []
+        valid_indices = [i for i, img in enumerate(images) if img is not None]
+        
+        if valid_indices:
+            with torch.no_grad():
+                image_tensors = torch.stack([
+                    self.preprocess(images[i]) for i in valid_indices
+                ]).to(self.device)
+                
+                image_features = self.model.encode_image(image_tensors)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                
+                # Cosine similarity (text_features is 1×D, image_features is N×D)
+                similarities = (text_features @ image_features.T).squeeze(0)
+            
+            for j, idx in enumerate(valid_indices):
+                results.append({
+                    "product_id": product_ids[idx],
+                    "similarity_score": round(similarities[j].item(), 4),
+                })
+        
+        # Add failed downloads with score 0
+        scored_ids = {r["product_id"] for r in results}
+        for pid in product_ids:
+            if pid not in scored_ids:
+                results.append({
+                    "product_id": pid,
+                    "similarity_score": 0.0,
+                })
+        
+        # Sort by similarity descending
+        results.sort(key=lambda x: x["similarity_score"], reverse=True)
+        
+        encode_ms = (time.time() - t0) * 1000 - download_ms
+        total_ms = (time.time() - t0) * 1000
+        logger.info(
+            f"CLIP re-rank: {len(valid_indices)}/{len(image_urls)} images scored "
+            f"in {total_ms:.0f}ms (download: {download_ms:.0f}ms, encode: {encode_ms:.0f}ms) "
+            f"for query: '{query}'"
+        )
+        
+        return results
 
 
 # ============================================================================
