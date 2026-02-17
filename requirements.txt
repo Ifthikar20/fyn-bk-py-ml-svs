@@ -12,6 +12,7 @@ faiss-cpu>=1.7.0
 
 # HTTP Client
 httpx>=0.26.0
+requests>=2.31
 
 # Attribute Extraction
 transformers>=4.36.0
