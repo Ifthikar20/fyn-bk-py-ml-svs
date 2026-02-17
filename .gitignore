@@ -1,2 +1,5 @@
 *.ipynb
 .DS_Store
+*.pt
+models/
+venv/
