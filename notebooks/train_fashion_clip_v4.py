@@ -933,6 +933,52 @@ print(f"   Resumed from: {resume_checkpoint or 'scratch'}")
 
 from tqdm import tqdm
 import time
+import signal
+
+# ---- PAUSE / RESUME MECHANISM ----
+# To PAUSE:  In a new Colab cell, run:  !touch /content/PAUSE_TRAINING
+# To RESUME: In a new Colab cell, run:  !rm /content/PAUSE_TRAINING
+# To STOP:   Press Ctrl+C (saves checkpoint before exiting)
+
+PAUSE_FLAG = "/content/PAUSE_TRAINING"
+
+def check_pause(epoch, batch_idx, model, optimizer, training_history, best_val_loss, global_step, total_loss, num_batches):
+    """Check if pause flag file exists. If so, save checkpoint and wait."""
+    if not os.path.exists(PAUSE_FLAG):
+        return
+    
+    print(f"\n⏸️  PAUSE detected at Epoch {epoch+1}, Batch {batch_idx+1}")
+    print(f"   Saving mid-epoch checkpoint...")
+    
+    # Save mid-epoch checkpoint so no progress is lost
+    pause_checkpoint = {
+        'epoch': epoch,                   # Not +1 — we haven't finished this epoch
+        'batch_idx': batch_idx,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_loss': total_loss / max(num_batches, 1),
+        'val_loss': best_val_loss,
+        'history': training_history,
+        'global_step': global_step,
+        'version': 'v4',
+        'model_name': model_name,
+        'paused': True,
+    }
+    torch.save(pause_checkpoint, os.path.join(CHECKPOINT_DIR, "v4_paused_checkpoint.pt"))
+    print(f"   ✅ Checkpoint saved to: v4_paused_checkpoint.pt")
+    print(f"   📊 Current train loss: {total_loss / max(num_batches, 1):.4f}")
+    print(f"   🏆 Best val loss: {best_val_loss:.4f}")
+    print()
+    print(f"   ⏳ Training PAUSED. Waiting for resume...")
+    print(f"   👉 To resume: run  !rm /content/PAUSE_TRAINING  in another cell")
+    print(f"   👉 To stop:   press Ctrl+C")
+    
+    # Poll until pause flag is removed
+    while os.path.exists(PAUSE_FLAG):
+        time.sleep(30)
+    
+    print(f"\n▶️  RESUMED! Continuing training from Epoch {epoch+1}, Batch {batch_idx+1}")
+
 
 def clip_loss_hard_negatives(image_features, text_features, temperature=0.07, hard_weight=2.0):
     """
@@ -994,6 +1040,11 @@ if resume_checkpoint == 'v4' and 'checkpoint' in dir():
     training_history = checkpoint.get('history', [])
     print(f"   Best val loss so far: {best_val_loss:.4f}")
 
+# Clean up any stale pause flag from a previous run
+if os.path.exists(PAUSE_FLAG):
+    os.remove(PAUSE_FLAG)
+    print("   🗑️ Removed stale pause flag from previous run")
+
 print("=" * 60)
 print("🚀 Starting Fashion-CLIP v4 Training")
 print(f"   NEW: ViT-B-16 + Hard Negatives + Augmentations + Layer Decay")
@@ -1002,126 +1053,161 @@ print(f"   Batch size: {BATCH_SIZE} (effective: {BATCH_SIZE * GRAD_ACCUM_STEPS})
 print(f"   Base LR: {LEARNING_RATE} (layer decay: {LAYER_DECAY}x)")
 print(f"   Training pairs: {len(train_dataset)}")
 print(f"   Trainable: {trainable:,} params ({100*trainable/total:.1f}%)")
+print(f"   ⏸️  To pause: run  !touch /content/PAUSE_TRAINING  in another cell")
 print("=" * 60)
 
-for epoch in range(start_epoch, NUM_EPOCHS):
-    # ---- Training ----
-    model.train()
-    total_loss = 0
-    num_batches = 0
-    epoch_start = time.time()
-    
-    progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
-    optimizer.zero_grad()
-    
-    for batch_idx, (images, texts) in enumerate(progress):
-        global_step += 1
-        images = images.to(device)
-        texts = texts.to(device)
+try:
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        # ---- Training ----
+        model.train()
+        total_loss = 0
+        num_batches = 0
+        epoch_start = time.time()
         
-        # Manual warmup: linearly increase LR for first N steps
-        if global_step <= WARMUP_STEPS:
-            warmup_factor = global_step / WARMUP_STEPS
-            for pg in optimizer.param_groups:
-                pg['lr'] = pg.get('lr', LEARNING_RATE) * warmup_factor
+        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
+        optimizer.zero_grad()
         
-        # Forward
-        image_features = model.encode_image(images)
-        text_features = model.encode_text(texts)
-        
-        # v4: Hard negative weighted loss
-        loss = clip_loss_hard_negatives(image_features, text_features)
-        loss = loss / GRAD_ACCUM_STEPS
-        
-        loss.backward()
-        
-        # Gradient accumulation
-        if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            if global_step > WARMUP_STEPS:
-                scheduler.step()
-            optimizer.zero_grad()
-        
-        total_loss += loss.detach().item() * GRAD_ACCUM_STEPS
-        num_batches += 1
-        
-        del loss, image_features, text_features
-        if (batch_idx + 1) % 500 == 0:
-            torch.cuda.empty_cache()
-        
-        current_lr = optimizer.param_groups[0]['lr']
-        progress.set_postfix({
-            'loss': f'{total_loss/num_batches:.4f}',
-            'lr': f'{current_lr:.2e}'
-        })
-    
-    avg_train_loss = total_loss / num_batches
-    
-    # ---- Validation (no augmentation, no hard negatives) ----
-    model.eval()
-    val_loss = 0
-    val_batches = 0
-    
-    # Use standard CLIP loss for validation (fair comparison with v3)
-    def standard_clip_loss(img_feat, txt_feat, temp=0.07):
-        img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
-        txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
-        logit_scale = 1.0 / temp
-        logits = logit_scale * img_feat @ txt_feat.T
-        labels = torch.arange(len(img_feat), device=img_feat.device)
-        return (torch.nn.functional.cross_entropy(logits, labels) +
-                torch.nn.functional.cross_entropy(logits.T, labels)) / 2
-    
-    with torch.no_grad():
-        for images, texts in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]"):
+        for batch_idx, (images, texts) in enumerate(progress):
+            # Check for pause flag every 100 batches (minimal overhead)
+            if (batch_idx + 1) % 100 == 0:
+                check_pause(epoch, batch_idx, model, optimizer, training_history,
+                           best_val_loss, global_step, total_loss, num_batches)
+            
+            global_step += 1
             images = images.to(device)
             texts = texts.to(device)
             
+            # Manual warmup: linearly increase LR for first N steps
+            if global_step <= WARMUP_STEPS:
+                warmup_factor = global_step / WARMUP_STEPS
+                for pg in optimizer.param_groups:
+                    pg['lr'] = pg.get('lr', LEARNING_RATE) * warmup_factor
+            
+            # Forward
             image_features = model.encode_image(images)
             text_features = model.encode_text(texts)
             
-            loss = standard_clip_loss(image_features, text_features)
-            val_loss += loss.item()
-            val_batches += 1
+            # v4: Hard negative weighted loss
+            loss = clip_loss_hard_negatives(image_features, text_features)
+            loss = loss / GRAD_ACCUM_STEPS
+            
+            loss.backward()
+            
+            # Gradient accumulation
+            if (batch_idx + 1) % GRAD_ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                if global_step > WARMUP_STEPS:
+                    scheduler.step()
+                optimizer.zero_grad()
+            
+            total_loss += loss.detach().item() * GRAD_ACCUM_STEPS
+            num_batches += 1
+            
+            del loss, image_features, text_features
+            if (batch_idx + 1) % 500 == 0:
+                torch.cuda.empty_cache()
+            
+            current_lr = optimizer.param_groups[0]['lr']
+            progress.set_postfix({
+                'loss': f'{total_loss/num_batches:.4f}',
+                'lr': f'{current_lr:.2e}'
+            })
+        
+        avg_train_loss = total_loss / num_batches
+        
+        # ---- Validation (no augmentation, no hard negatives) ----
+        model.eval()
+        val_loss = 0
+        val_batches = 0
+        
+        # Use standard CLIP loss for validation (fair comparison with v3)
+        def standard_clip_loss(img_feat, txt_feat, temp=0.07):
+            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+            txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+            logit_scale = 1.0 / temp
+            logits = logit_scale * img_feat @ txt_feat.T
+            labels = torch.arange(len(img_feat), device=img_feat.device)
+            return (torch.nn.functional.cross_entropy(logits, labels) +
+                    torch.nn.functional.cross_entropy(logits.T, labels)) / 2
+        
+        with torch.no_grad():
+            for images, texts in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]"):
+                images = images.to(device)
+                texts = texts.to(device)
+                
+                image_features = model.encode_image(images)
+                text_features = model.encode_text(texts)
+                
+                loss = standard_clip_loss(image_features, text_features)
+                val_loss += loss.item()
+                val_batches += 1
+        
+        avg_val_loss = val_loss / val_batches
+        epoch_time = time.time() - epoch_start
+        
+        training_history.append({
+            'epoch': epoch + 1,
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'time': epoch_time
+        })
+        
+        print(f"\n📊 Epoch {epoch+1} Summary:")
+        print(f"   Train Loss: {avg_train_loss:.4f}")
+        print(f"   Val Loss:   {avg_val_loss:.4f}")
+        print(f"   Time:       {epoch_time/60:.1f} min")
+        
+        # Save checkpoint
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'history': training_history,
+            'version': 'v4',
+            'model_name': model_name,
+        }
+        
+        torch.save(checkpoint, os.path.join(CHECKPOINT_DIR, f"v4_checkpoint_epoch_{epoch+1}.pt"))
+        
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(checkpoint, os.path.join(CHECKPOINT_DIR, "best_model_v4.pt"))
+            print(f"   ✅ New best model saved! (val_loss: {avg_val_loss:.4f})")
+        else:
+            print(f"   ◻️ No improvement (best: {best_val_loss:.4f})")
+        
+        # Check for pause between epochs too
+        check_pause(epoch, batch_idx, model, optimizer, training_history,
+                   best_val_loss, global_step, total_loss, num_batches)
+        
+        print()
+
+except KeyboardInterrupt:
+    print(f"\n\n🛑 Training interrupted by Ctrl+C!")
+    print(f"   Saving emergency checkpoint...")
     
-    avg_val_loss = val_loss / val_batches
-    epoch_time = time.time() - epoch_start
-    
-    training_history.append({
-        'epoch': epoch + 1,
-        'train_loss': avg_train_loss,
-        'val_loss': avg_val_loss,
-        'time': epoch_time
-    })
-    
-    print(f"\n📊 Epoch {epoch+1} Summary:")
-    print(f"   Train Loss: {avg_train_loss:.4f}")
-    print(f"   Val Loss:   {avg_val_loss:.4f}")
-    print(f"   Time:       {epoch_time/60:.1f} min")
-    
-    # Save checkpoint
-    checkpoint = {
-        'epoch': epoch + 1,
+    emergency_checkpoint = {
+        'epoch': epoch,
+        'batch_idx': batch_idx,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'train_loss': avg_train_loss,
-        'val_loss': avg_val_loss,
+        'train_loss': total_loss / max(num_batches, 1),
+        'val_loss': best_val_loss,
         'history': training_history,
+        'global_step': global_step,
         'version': 'v4',
         'model_name': model_name,
+        'interrupted': True,
     }
+    torch.save(emergency_checkpoint, os.path.join(CHECKPOINT_DIR, "v4_interrupted_checkpoint.pt"))
     
-    torch.save(checkpoint, os.path.join(CHECKPOINT_DIR, f"v4_checkpoint_epoch_{epoch+1}.pt"))
-    
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        torch.save(checkpoint, os.path.join(CHECKPOINT_DIR, "best_model_v4.pt"))
-        print(f"   ✅ New best model saved! (val_loss: {avg_val_loss:.4f})")
-    else:
-        print(f"   ◻️ No improvement (best: {best_val_loss:.4f})")
-    
-    print()
+    print(f"   ✅ Emergency checkpoint saved: v4_interrupted_checkpoint.pt")
+    print(f"   📊 Train loss at interruption: {total_loss / max(num_batches, 1):.4f}")
+    print(f"   🏆 Best val loss: {best_val_loss:.4f}")
+    print(f"   💾 Best model is still safe at: best_model_v4.pt")
 
 print("=" * 60)
 print("🎉 v4 Training Complete!")
