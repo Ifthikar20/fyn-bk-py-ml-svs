@@ -123,10 +123,12 @@ class FashionCLIP:
         self.is_fine_tuned = False
         
         if model_dir is None:
-            model_dir = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                'models', 'fashion_clip'
+            # __file__ = <project>/app/models/fashion_clip.py
+            # 3 x dirname: fashion_clip.py → models/ → app/ → <project root>
+            project_root = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             )
+            model_dir = os.path.join(project_root, 'models', 'fashion_clip')
         
         self._load_model(model_dir)
         self._precompute_text_features()
