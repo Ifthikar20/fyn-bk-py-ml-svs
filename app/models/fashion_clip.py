@@ -133,7 +133,18 @@ class FashionCLIP:
     
     def _load_model(self, model_dir: str):
         """Load the CLIP model (fine-tuned or base)."""
-        model_name = 'ViT-B-32'
+        # Read architecture from config.json (v4 uses ViT-B-16, v3 used ViT-B-32)
+        config_path = os.path.join(model_dir, 'config.json')
+        model_name = 'ViT-B-32'  # default fallback
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                model_name = config.get('model_name', 'ViT-B-32')
+                version = config.get('version', 'unknown')
+                logger.info(f"📋 Config: {model_name} (version: {version})")
+            except Exception as e:
+                logger.warning(f"Could not read config.json: {e}. Using default {model_name}")
         
         t0 = time.time()
         
@@ -148,7 +159,7 @@ class FashionCLIP:
                 self.model.load_state_dict(state_dict)
                 self.model.eval()
                 self.is_fine_tuned = True
-                logger.info(f"✅ Loaded fine-tuned Fashion-CLIP from {weights_path}")
+                logger.info(f"✅ Loaded fine-tuned Fashion-CLIP ({model_name}) from {weights_path}")
             except Exception as e:
                 logger.warning(f"Failed to load fine-tuned model: {e}. Falling back to base CLIP.")
                 self._load_base_model(model_name)
